@@ -118,7 +118,10 @@ class MeldBufferData(GObject.GObject):
     def reset(self, gfile):
         same_file = gfile and self._gfile and gfile.equal(self._gfile)
         self.gfile = gfile
-        self.label = self._label if same_file else self.filename
+        if same_file:
+            self.label = self._label
+        else:
+            self.label = gfile.get_parse_name() if gfile else None
         self.loaded = False
         self.savefile = None
 
@@ -212,7 +215,11 @@ class MeldBufferData(GObject.GObject):
         try:
             info = self.gfiletarget.query_info(
                 Gio.FILE_ATTRIBUTE_ACCESS_CAN_WRITE, 0, None)
-        except (AttributeError, GLib.GError):
+        except GLib.GError as err:
+            if err.code == Gio.IOErrorEnum.NOT_FOUND:
+                return True
+            return False
+        except AttributeError:
             return False
         return info.get_attribute_boolean(Gio.FILE_ATTRIBUTE_ACCESS_CAN_WRITE)
 

@@ -141,18 +141,20 @@ class MeldApp(Gtk.Application):
     def get_meld_window(self):
         return self.get_active_window().meldwindow
 
-    def open_files(self, files, **kwargs):
-        new_tab = kwargs.pop('new_tab')
-        if new_tab:
-            window = self.get_meld_window()
-        else:
-            window = self.new_window()
+    def open_files(
+            self, gfiles, *, window=None, close_on_error=False, **kwargs):
+        """Open a comparison between files in a Meld window
 
-        paths = [f.get_path() for f in files]
+        :param gfiles: list of Gio.File to be compared
+        :param window: window in which to open comparison tabs; if
+            None, the current window is used
+        :param close_on_error: if true, close window if an error occurs
+        """
+        window = window or self.get_meld_window()
         try:
-            return window.open_paths(paths, **kwargs)
+            return window.open_paths(gfiles, **kwargs)
         except ValueError:
-            if not new_tab:
+            if close_on_error:
                 self.remove_window(window.widget)
             raise
 
@@ -284,9 +286,9 @@ class MeldApp(Gtk.Application):
             parser.local_error(_("too many arguments (wanted 0-3, got %d)") %
                                len(args))
         elif options.auto_merge and len(args) < 3:
-            parser.local_error(_("can't auto-merge less than 3 files"))
+            parser.local_error(_("can’t auto-merge less than 3 files"))
         elif options.auto_merge and any([os.path.isdir(f) for f in args]):
-            parser.local_error(_("can't auto-merge directories"))
+            parser.local_error(_("can’t auto-merge directories"))
 
         if parser.should_exit:
             cleanup()
@@ -320,21 +322,42 @@ class MeldApp(Gtk.Application):
         tab = None
         error = None
         comparisons = [args] + options.diff
-        options.newtab = options.newtab or not command_line.get_is_remote()
+
+        # Every Meld invocation creates at most one window. If there is
+        # no existing application, a window is created in do_startup().
+        # If there is an existing application, then this is a remote
+        # invocation, in which case we'll create a window if and only
+        # if the new-tab flag is not provided.
+        #
+        # In all cases, all tabs newly created here are attached to the
+        # same window, either implicitly by using the most-recently-
+        # focused window, or explicitly as below.
+        window = None
+        close_on_error = False
+        if command_line.get_is_remote() and not options.newtab:
+            window = self.new_window()
+            close_on_error = True
+
         for i, paths in enumerate(comparisons):
             files = [make_file_from_command_line(p) for p in paths]
             auto_merge = options.auto_merge and i == 0
             try:
                 for p, f in zip(paths, files):
-                    if f.get_path() is None:
-                        raise ValueError(_("invalid path or URI \"%s\"") % p)
+                    # TODO: support for directories specified by URIs
+                    if f.get_uri() is None or (not f.is_native() and
+                        f.query_file_type(Gio.FileQueryInfoFlags.NONE, None) ==
+                            Gio.FileType.DIRECTORY):
+                        raise ValueError(_("invalid path or URI “%s”") % p)
                 tab = self.open_files(
-                    files, auto_compare=options.auto_compare,
-                    auto_merge=auto_merge, new_tab=options.newtab,
-                    focus=i == 0)
+                    files, window=window,
+                    close_on_error=close_on_error,
+                    auto_compare=options.auto_compare,
+                    auto_merge=auto_merge,
+                    focus=i == 0,
+                )
             except ValueError as err:
-                log.debug("Couldn't open comparison: %s", error, exc_info=True)
                 error = err
+                log.debug("Couldn't open comparison: %s", error, exc_info=True)
             else:
                 if i > 0:
                     continue
@@ -351,6 +374,9 @@ class MeldApp(Gtk.Application):
                 parser.local_error(error)
             else:
                 print(error)
+            # Delete the error here; otherwise we keep the local app
+            # alive in a reference cycle, and the command line hangs.
+            del error
 
         if parser.should_exit:
             cleanup()

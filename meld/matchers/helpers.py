@@ -1,7 +1,7 @@
 
 import logging
+import multiprocessing
 import queue
-import threading
 import time
 
 from gi.repository import GLib
@@ -12,7 +12,9 @@ from meld.matchers import myers
 log = logging.getLogger(__name__)
 
 
-class MatcherWorker(threading.Thread):
+class MatcherWorker(multiprocessing.Process):
+
+    END_TASK = -1
 
     matcher_class = myers.InlineMyersSequenceMatcher
 
@@ -25,6 +27,9 @@ class MatcherWorker(threading.Thread):
     def run(self):
         while True:
             task_id, (text1, textn) = self.tasks.get()
+            if task_id == self.END_TASK:
+                break
+
             try:
                 matcher = self.matcher_class(None, text1, textn)
                 self.results.put((task_id, matcher.get_opcodes()))
@@ -43,18 +48,32 @@ class CachedSequenceMatcher(object):
     eviction is overly simplistic, but is okay for our usage pattern.
     """
 
-    def __init__(self):
+    TASK_GRACE_PERIOD = 5
+
+    def __init__(self, scheduler):
+        """Create a new caching sequence matcher
+
+        :param scheduler: a `meld.task.SchedulerBase` used to schedule
+            sequence comparison result checks
+        """
+        self.scheduler = scheduler
         self.cache = {}
-        self.tasks = queue.Queue()
+        self.tasks = multiprocessing.JoinableQueue()
         # Limiting the result queue here has the effect of giving us
         # much better interactivity. Without this limit, the
         # result-checker tends to get starved and all highlights get
         # delayed until we're almost completely finished.
-        self.results = queue.Queue(5)
+        self.results = multiprocessing.JoinableQueue(5)
         self.thread = MatcherWorker(self.tasks, self.results)
         self.task_id = 1
         self.queued_matches = {}
         GLib.idle_add(self.thread.start)
+
+    def __del__(self):
+        self.tasks.put((MatcherWorker.END_TASK, ('', '')))
+        self.thread.join(self.TASK_GRACE_PERIOD)
+        if self.thread.exitcode is None:
+            self.thread.terminate()
 
     def match(self, text1, textn, cb):
         texts = (text1, textn)
@@ -67,14 +86,14 @@ class CachedSequenceMatcher(object):
 
     def enqueue_task(self, texts, cb):
         if not bool(self.queued_matches):
-            GLib.idle_add(self.check_results)
+            self.scheduler.add_task(self.check_results)
         self.queued_matches[self.task_id] = (texts, cb)
         self.tasks.put((self.task_id, texts))
         self.task_id += 1
 
     def check_results(self):
         try:
-            task_id, opcodes = self.results.get_nowait()
+            task_id, opcodes = self.results.get(block=True, timeout=0.01)
             texts, cb = self.queued_matches.pop(task_id)
             self.cache[texts] = [opcodes, time.time()]
             GLib.idle_add(lambda: cb(opcodes))
@@ -88,7 +107,7 @@ class CachedSequenceMatcher(object):
 
         @param size_hint: the recommended minimum number of cache entries
         """
-        if len(self.cache) < size_hint * 3:
+        if len(self.cache) <= size_hint * 3:
             return
         items = list(self.cache.items())
         items.sort(key=lambda it: it[1][1])
